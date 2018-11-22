@@ -2,12 +2,15 @@
  * @Author: uapv1701795
  * @Date:   2018-11-22T15:02:30+01:00
  * @Last modified by:   uapv1701795
- * @Last modified time: 2018-11-22T17:57:09+01:00
+ * @Last modified time: 2018-11-22T18:55:32+01:00
  */
  #include "../sockin.h"
  #include <limits.h>
  #include <signal.h>
  #include <sys/wait.h>
+ #include <dirent.h>
+ #include <sys/stat.h>
+ #include <time.h>
 
  #define PORT 9000
  #define BUFFER_MAX 512
@@ -35,6 +38,8 @@
 typedef struct ftp {
   int logged;
   int acc;
+  int mode;
+  int p_acc;
   char *username;
   char *msg;
 } ftp;
@@ -81,6 +86,37 @@ void welcome(int sock_acc) {
   write(sock_acc, welcome, strlen(welcome));
 }
 
+int create_socket(int port)
+{
+  int sock;
+  int reuse = 1;
+
+  /* Server addess */
+  struct sockaddr_in server_address = (struct sockaddr_in){
+     AF_INET,
+     htons(port),
+     (struct in_addr){INADDR_ANY}
+  };
+
+
+  if((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0){
+    fprintf(stderr, "Cannot open socket");
+    exit(EXIT_FAILURE);
+  }
+
+  /* Address can be reused instantly after program exits */
+  setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+
+  /* Bind socket to server address */
+  if(bind(sock,(struct sockaddr*) &server_address, sizeof(server_address)) < 0){
+    fprintf(stderr, "Cannot bind socket to address");
+    exit(EXIT_FAILURE);
+  }
+
+  listen(sock,5);
+  return sock;
+}
+
 void serve(int sock_acc) {
   int acc, msg, fl, Tcode;
   char fname[UCHAR_MAX];
@@ -123,6 +159,14 @@ void serve(int sock_acc) {
 
 }
 
+int acceptc(int socket)
+{
+  int addrlen = 0;
+  struct sockaddr_in client_address;
+  addrlen = sizeof(client_address);
+  return accept(socket,(struct sockaddr*) &client_address,&addrlen);
+}
+
 void push(ftp *Ftp)
 {
   write(Ftp->acc, Ftp->msg, strlen(Ftp->msg));
@@ -137,6 +181,38 @@ int in(char *p, const char ** stack, int sz) {
     if(strcmp(p, stack[i])==0) return i;
   }
   return -1;
+}
+
+int new_port() {
+  srand(time(NULL));
+  return 128 + (rand()%64);
+}
+
+void str_perm(int perm, char *str_perm) {
+  int curperm = 0;
+  int flag = 0;
+  int read, write, exec;
+
+  /* Flags buffer */
+  char fbuff[3];
+
+  read = write = exec = 0;
+
+  int i;
+  for(i = 6; i>=0; i-=3){
+  /* Explode permissions of user, group, others; starting with users */
+  curperm = ((perm & ALLPERMS) >> i ) & 0x7;
+
+  memset(fbuff,0,3);
+  /* Check rwx flags for each*/
+  read = (curperm >> 2) & 0x1;
+  write = (curperm >> 1) & 0x1;
+  exec = (curperm >> 0) & 0x1;
+
+  sprintf(fbuff,"%c%c%c",read?'r':'-' ,write?'w':'-', exec?'x':'-');
+  strcat(str_perm,fbuff);
+
+  }
 }
 
 void _pass(command *cmd, ftp *Ftp) {
@@ -184,8 +260,91 @@ void _pwd(command *cmd, ftp *Ftp) {
   }
 }
 
+void _type(command *cmd, ftp *Ftp) {
+  if(Ftp->logged) {
+    if(cmd->arg[0]=='I'){
+      Ftp->msg = "200 Switch to binary\n";
+    } else if(cmd->arg[0]=='A') {
+      Ftp->msg = "200 Switch to ASCII\n";
+    } else {
+      Ftp->msg = "504 Swicth mode unailable\n";
+    }
+  } else {
+    Ftp->msg = "530 please login\n";
+  }
+  push(Ftp);
+}
+
+void sockize(int sock, int *ip) {
+  socklen_t addrl = sizeof(struct sockaddr_in);
+  struct sockaddr_in addr;
+  getsockname(sock, (struct sockaddr *)&addr, &addrl);
+  char* host = inet_ntoa(addr.sin_addr);
+  sscanf(host,"%d.%d.%d.%d",&ip[0],&ip[1],&ip[2],&ip[3]);
+}
+
+void _pasv(command *cmd, ftp *Ftp) {
+  if(Ftp->logged) {
+    int ip[4];
+    char buff[UCHAR_MAX];
+    int port = new_port();
+    sockize(Ftp->acc, ip);
+    close(Ftp->acc);
+    Ftp->p_acc = create_socket((256*port)+port);
+    printf("Port: %d\n",(256*port)+port);
+    sprintf(buff, "227 Passive Mode (%d,%d,%d,%d,%d,%d)\n", ip[0],ip[1],ip[2],ip[3],256*port, port);
+    Ftp->msg = buff;
+    Ftp->mode = 1;
+    puts(Ftp->msg);
+  } else {
+    Ftp->msg = "530 please login\n";
+  }
+  push(Ftp);
+}
+
 void _list(command *cmd, ftp *Ftp) {
-  
+  if(Ftp->logged) {
+    struct dirent *ent;
+    struct stat statbuf;
+    struct tm *mtime;
+    char timebuff[80], current_dir[UCHAR_MAX];
+    int acc;
+    time_t rtime;
+
+    char cwd[UCHAR_MAX], cwd_o[UCHAR_MAX];
+    memset(cwd,0,UCHAR_MAX);
+    memset(cwd_o,0,UCHAR_MAX);
+    getcwd(cwd_o,UCHAR_MAX);
+    if(strlen(cmd->arg)>0&&cmd->arg[0]!='-') chdir(cmd->arg);
+    getcwd(cwd, UCHAR_MAX);
+    DIR *d = opendir(cwd);
+    if(!d) Ftp->msg = "550 Failed to opendir\n";
+    else {
+      //acc = acceptc()
+      Ftp->msg = "150 getting dir list\n";
+      push(Ftp);
+      while(ent=readdir(d)) {
+        stat(ent->d_name,&statbuf);
+        char *perm = malloc(9);
+        memset(perm,0,9);
+        rtime = statbuf.st_mtime;
+        mtime = localtime(&rtime);
+        strftime(timebuff,80,"%b %d %H:%M", mtime);
+        str_perm(statbuf.st_mode, perm);
+        dprintf(Ftp->acc, "%c%s %5ld %4d %4d %8ld %s %s\n",
+          (ent->d_type==DT_DIR)?'d':'-',
+          perm, statbuf.st_nlink, statbuf.st_uid, statbuf.st_gid, statbuf.st_size, timebuff, ent->d_name);
+      }
+      push(Ftp);
+      Ftp->msg = "226 Dir send done.\n";
+      //close()
+    }
+    closedir(d);
+    chdir(cwd_o);
+  } else {
+    Ftp->msg = "530 please login\n";
+  }
+  push(Ftp);
 }
 
 void reply(command *cmd, ftp *Ftp) {
@@ -193,6 +352,9 @@ void reply(command *cmd, ftp *Ftp) {
   else if (strcmp(cmd->comm, "PASS")==0) _pass(cmd, Ftp);
   else if (strcmp(cmd->comm, "QUIT")==0) _quit(cmd, Ftp);
   else if (strcmp(cmd->comm, "PWD")==0) _pwd(cmd, Ftp);
+  else if (strcmp(cmd->comm, "LIST")==0) _list(cmd, Ftp);
+  else if (strcmp(cmd->comm, "TYPE")==0) _type(cmd, Ftp);
+  else if (strcmp(cmd->comm, "PASV")==0) _pasv(cmd, Ftp);
   else {
     Ftp->msg = "500 unknown command\n";
     push(Ftp);
